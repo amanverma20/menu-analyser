@@ -17,7 +17,8 @@ export class MenuParser {
     'vegetarian', 'vegan', 'sides', 'desserts',
     'beverages', 'drinks', 'cocktails', 'wine', 'beer',
     'breakfast', 'lunch', 'dinner', 'brunch',
-    'specials', 'daily specials', 'chef specials'
+    'specials', 'daily specials', 'chef specials',
+    'fries', 'french fries'
   ];
 
   private static readonly HEALTHY_KEYWORDS = [
@@ -44,7 +45,11 @@ export class MenuParser {
   ];
 
   public static parseMenuText(ocrText: string): ParsedMenu {
+    console.log('Raw OCR Text:', ocrText);
+    
     const lines = ocrText.split('\n').map(line => line.trim()).filter(line => line.length > 0);
+    console.log('Processed lines:', lines);
+    
     const categories: MenuCategory[] = [];
     let currentCategory: MenuCategory | null = null;
     let restaurantName = '';
@@ -58,53 +63,37 @@ export class MenuParser {
       }
     }
 
-    for (let i = 0; i < lines.length; i++) {
-      const line = lines[i];
-      const nextLine = i + 1 < lines.length ? lines[i + 1] : '';
+    // Enhanced parsing approach
+    const allItems = this.extractAllMenuItems(lines);
+    console.log('Extracted items:', allItems);
 
-      if (this.isLikelyCategory(line)) {
-        if (currentCategory && currentCategory.items.length > 0) {
-          this.enhanceCategoryData(currentCategory);
-          categories.push(currentCategory);
-        }
-        
-        currentCategory = {
-          category: this.cleanCategoryName(line),
-          items: []
-        };
-        continue;
-      }
+    // Group items by category if categories are detected
+    const detectedCategories = this.detectCategories(lines);
+    console.log('Detected categories:', detectedCategories);
 
-      if (currentCategory && this.isLikelyMenuItem(line)) {
-        const item = this.parseMenuItem(line, nextLine);
-        if (item) {
-          currentCategory.items.push(item);
-        }
-      } else if (!currentCategory && this.isLikelyMenuItem(line)) {
-        if (!currentCategory) {
-          currentCategory = {
-            category: 'Menu Items',
-            items: []
+    if (detectedCategories.length > 0) {
+      // Process with categories
+      for (const categoryInfo of detectedCategories) {
+        const categoryItems = allItems.filter(item => 
+          item.lineIndex >= categoryInfo.startIndex && 
+          item.lineIndex < categoryInfo.endIndex
+        );
+
+        if (categoryItems.length > 0) {
+          const category: MenuCategory = {
+            category: categoryInfo.name,
+            items: categoryItems.map(item => item.menuItem)
           };
-        }
-        const item = this.parseMenuItem(line, nextLine);
-        if (item) {
-          currentCategory.items.push(item);
+          this.enhanceCategoryData(category);
+          categories.push(category);
         }
       }
-    }
-
-    if (currentCategory && currentCategory.items.length > 0) {
-      this.enhanceCategoryData(currentCategory);
-      categories.push(currentCategory);
-    }
-
-    if (categories.length === 0) {
-      const items = this.parseSimpleItemList(lines);
-      if (items.length > 0) {
+    } else {
+      // No categories detected, put all items in one category
+      if (allItems.length > 0) {
         const category: MenuCategory = {
           category: 'Menu Items',
-          items
+          items: allItems.map(item => item.menuItem)
         };
         this.enhanceCategoryData(category);
         categories.push(category);
@@ -120,37 +109,139 @@ export class MenuParser {
     };
 
     parsedMenu.summary = this.generateMenuSummary(parsedMenu);
+    console.log('Final parsed menu:', parsedMenu);
 
     return parsedMenu;
   }
 
-  private static parseMenuItem(line: string, nextLine: string = ''): MenuItem | null {
-    const fullText = nextLine && !this.isLikelyCategory(nextLine) && !this.containsPrice(nextLine) 
-      ? `${line} ${nextLine}` 
-      : line;
-
-    const price = this.extractPrice(fullText);
-    const cleanedText = this.removePriceFromText(fullText);
+  private static extractAllMenuItems(lines: string[]): Array<{menuItem: MenuItem, lineIndex: number}> {
+    const items: Array<{menuItem: MenuItem, lineIndex: number}> = [];
     
-    const parts = cleanedText.split(/[-.—]/);
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+      
+      // Skip category headers
+      if (this.isLikelyCategory(line)) {
+        continue;
+      }
+
+      // Try to parse as menu item
+      const menuItem = this.parseMenuItemAdvanced(line);
+      if (menuItem) {
+        items.push({ menuItem, lineIndex: i });
+      }
+    }
+
+    return items;
+  }
+
+  private static parseMenuItemAdvanced(line: string): MenuItem | null {
+    console.log('Parsing line:', line);
+    
+    // Extract all prices from the line
+    const prices = this.extractAllPrices(line);
+    console.log('Found prices:', prices);
+    
+    // Remove all prices to get the name part
+    let nameText = line;
+    for (const pattern of this.PRICE_PATTERNS) {
+      pattern.lastIndex = 0;
+      nameText = nameText.replace(pattern, '');
+    }
+    
+    // Clean up the name
+    nameText = nameText.trim();
+    nameText = nameText.replace(/\s+/g, ' '); // Replace multiple spaces with single space
+    nameText = nameText.replace(/[^\w\s&'-]/g, ''); // Remove special chars except &, ', -
+    
+    console.log('Cleaned name text:', nameText);
+    
+    // Skip if name is too short or looks invalid
+    if (!nameText || nameText.length < 3) {
+      console.log('Skipping - name too short');
+      return null;
+    }
+
+    // Skip if it's just numbers or common non-menu text
+    if (/^\d+$/.test(nameText) || 
+        nameText.toLowerCase().includes('menu') ||
+        nameText.toLowerCase().includes('page') ||
+        nameText.toLowerCase().includes('call') ||
+        nameText.toLowerCase().includes('phone')) {
+      console.log('Skipping - not a menu item');
+      return null;
+    }
+
+    // Split name and description if there's a dash or colon
+    const parts = nameText.split(/[-:]/);
     const name = parts[0]?.trim();
     const description = parts.slice(1).join(' - ').trim();
 
     if (!name || name.length < 2) {
+      console.log('Skipping - invalid name after splitting');
       return null;
     }
+
+    // Use the first price found, or undefined if no price
+    const price = prices.length > 0 ? prices[0] : undefined;
 
     const item: MenuItem = {
       name: this.capitalizeWords(name),
       description: description.length > 0 ? description : undefined,
-      price: price || undefined,
+      price: price,
       currency: price ? 'USD' : undefined
     };
 
     // Enhance with additional features
-    this.enhanceMenuItem(item, fullText);
-
+    this.enhanceMenuItem(item, line);
+    
+    console.log('Created menu item:', item);
     return item;
+  }
+
+  private static extractAllPrices(text: string): number[] {
+    const prices: number[] = [];
+    
+    for (const pattern of this.PRICE_PATTERNS) {
+      pattern.lastIndex = 0;
+      let match;
+      while ((match = pattern.exec(text)) !== null) {
+        const priceStr = match[1];
+        const price = parseFloat(priceStr);
+        if (!isNaN(price) && price > 0 && price < 1000) { // Reasonable price range
+          prices.push(price);
+        }
+      }
+    }
+    
+    return [...new Set(prices)]; // Remove duplicates
+  }
+
+  private static detectCategories(lines: string[]): Array<{name: string, startIndex: number, endIndex: number}> {
+    const categories: Array<{name: string, startIndex: number, endIndex: number}> = [];
+    
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+      if (this.isLikelyCategory(line)) {
+        const nextCategoryIndex = this.findNextCategoryIndex(lines, i + 1);
+        categories.push({
+          name: this.cleanCategoryName(line),
+          startIndex: i + 1,
+          endIndex: nextCategoryIndex !== -1 ? nextCategoryIndex : lines.length
+        });
+      }
+    }
+    
+    return categories;
+  }
+
+  private static findNextCategoryIndex(lines: string[], startIndex: number): number {
+    for (let i = startIndex; i < lines.length; i++) {
+      if (this.isLikelyCategory(lines[i])) {
+        return i;
+      }
+    }
+    return -1;
   }
 
   private static enhanceMenuItem(item: MenuItem, fullText: string): void {
@@ -202,10 +293,12 @@ export class MenuParser {
     if (text.includes('pasta')) baseCalories = 500;
     if (text.includes('steak') || text.includes('ribs')) baseCalories = 700;
     if (text.includes('dessert') || text.includes('cake')) baseCalories = 400;
+    if (text.includes('fries')) baseCalories = 350;
 
     // Adjust based on cooking method
     if (text.includes('fried') || text.includes('crispy')) baseCalories += 200;
     if (text.includes('grilled') || text.includes('steamed')) baseCalories -= 50;
+    if (text.includes('loaded')) baseCalories += 150;
 
     // Adjust based on price (higher price often means larger portions)
     if (price && price > 20) baseCalories += 100;
@@ -226,14 +319,18 @@ export class MenuParser {
     if (text.includes('chicken') || text.includes('beef') || text.includes('fish')) {
       nutrition.protein += 20;
     }
-    if (text.includes('pasta') || text.includes('rice') || text.includes('bread')) {
+    if (text.includes('pasta') || text.includes('rice') || text.includes('bread') || text.includes('fries')) {
       nutrition.carbs += 25;
     }
-    if (text.includes('avocado') || text.includes('nuts') || text.includes('cheese')) {
+    if (text.includes('avocado') || text.includes('nuts') || text.includes('cheese') || text.includes('loaded')) {
       nutrition.fat += 15;
     }
     if (text.includes('vegetables') || text.includes('beans') || text.includes('quinoa')) {
       nutrition.fiber += 8;
+    }
+    if (text.includes('sweet potato')) {
+      nutrition.fiber += 5;
+      nutrition.carbs += 10;
     }
 
     return nutrition;
@@ -303,7 +400,7 @@ export class MenuParser {
     return `menu_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
   }
 
-  // Helper methods (keeping existing ones)
+  // Helper methods
   private static isLikelyRestaurantName(line: string): boolean {
     const cleaned = line.toLowerCase();
     return (
@@ -338,67 +435,11 @@ export class MenuParser {
     );
   }
 
-  private static isLikelyMenuItem(line: string): boolean {
-    const hasPrice = this.containsPrice(line);
-    const hasText = line.length > 5;
-    const isNotCategory = !this.isLikelyCategory(line);
-    
-    return hasText && isNotCategory && (hasPrice || this.looksLikeItemName(line));
-  }
-
-  private static looksLikeItemName(line: string): boolean {
-    const words = line.split(/\s+/);
-    return (
-      words.length >= 1 && 
-      words.length <= 8 &&
-      words[0][0]?.toUpperCase() === words[0][0]
-    );
-  }
-
   private static containsPrice(text: string): boolean {
     return this.PRICE_PATTERNS.some(pattern => {
       pattern.lastIndex = 0;
       return pattern.test(text);
     });
-  }
-
-  private static parseSimpleItemList(lines: string[]): MenuItem[] {
-    const items: MenuItem[] = [];
-    
-    for (const line of lines) {
-      if (this.isLikelyMenuItem(line)) {
-        const item = this.parseMenuItem(line);
-        if (item) {
-          items.push(item);
-        }
-      }
-    }
-    
-    return items;
-  }
-
-  private static extractPrice(text: string): number | null {
-    for (const pattern of this.PRICE_PATTERNS) {
-      pattern.lastIndex = 0;
-      const match = pattern.exec(text);
-      if (match) {
-        const priceStr = match[1];
-        const price = parseFloat(priceStr);
-        if (!isNaN(price)) {
-          return price;
-        }
-      }
-    }
-    return null;
-  }
-
-  private static removePriceFromText(text: string): string {
-    let cleaned = text;
-    for (const pattern of this.PRICE_PATTERNS) {
-      pattern.lastIndex = 0;
-      cleaned = cleaned.replace(pattern, '');
-    }
-    return cleaned.trim();
   }
 
   private static cleanCategoryName(name: string): string {
